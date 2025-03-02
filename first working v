@@ -1,0 +1,192 @@
+import uvicorn
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, date
+import secrets
+import os
+import sqlalchemy
+from sqlalchemy import create_engine, MetaData, Column, Integer, String, Boolean, Date, DateTime, ForeignKey, select
+from sqlalchemy.orm import sessionmaker, DeclarativeBase, Session
+from sqlalchemy.engine import URL
+from fastapi.responses import FileResponse
+
+db_url = "(db_path)"
+
+engine = create_engine(db_url, echo=False)
+
+metadata = MetaData(schema='foronesport')
+
+class Base(DeclarativeBase):
+    metadata = metadata
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Application(Base):
+    __tablename__ = "applications"
+    __table_args__ = {'schema': 'foronesport'}
+
+    id = Column(Integer, primary_key=True, index=True)
+    team_name = Column(String, nullable=False)
+    region = Column(String, nullable=False)
+    contact_person = Column(String, nullable=False)
+    leader_name = Column(String, nullable=False)
+    login = Column(String, nullable=False, unique=True)
+    password = Column(String, nullable=False)
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+
+class TeamMember(Base):
+    __tablename__ = "team_members"
+    __table_args__ = {'schema': 'foronesport'}
+
+    id = Column(Integer, primary_key=True, index=True)
+    application_id = Column(Integer, ForeignKey("foronesport.applications.id"), nullable=False)
+    name = Column(String, nullable=False)
+    date_of_birth = Column(Date, nullable=False)
+    phone = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    role = Column(String, nullable=False)  # "тренер", "главный", "участник", "сопроводила"
+    sport = Column(String, nullable=True)  # Вид спорта (для тренера, участника и т.д.)
+    student_card = Column(String, nullable=True)
+    disability = Column(Boolean, nullable=True)
+    disability_reason = Column(String, nullable=True)
+
+app = FastAPI()
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+class ApplicationIn(BaseModel):
+    team_name: str
+    region: str
+    contact_person: str
+    leader_name: str
+
+class ApplicationOut(ApplicationIn):
+    id: int
+    login: str
+    password: str
+    submitted_at: datetime
+
+    class Config:
+        orm_mode = True
+
+class TeamMemberIn(BaseModel):
+    application_id: int
+    name: str
+    date_of_birth: date
+    phone: str
+    email: str
+    role: str
+    sport: Optional[str] = None
+    student_card: Optional[str] = None
+    disability: Optional[bool] = None
+    disability_reason: Optional[str] = None
+
+class TeamMemberOut(TeamMemberIn):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@app.post("/application", response_model=ApplicationOut)
+async def submit_application(app_in: ApplicationIn, db: Session = Depends(get_db)):
+    login = app_in.leader_name.upper().replace(" ", "") + secrets.token_hex(3)
+    password = secrets.token_urlsafe(8)
+    db_app = Application(
+        team_name=app_in.team_name,
+        region=app_in.region,
+        contact_person=app_in.contact_person,
+        leader_name=app_in.leader_name,
+        login=login,
+        password=password,
+        submitted_at=datetime.utcnow()
+    )
+    db.add(db_app)
+    db.commit()
+    db.refresh(db_app)
+    return db_app
+
+@app.get("/admin/applications", response_model=List[ApplicationOut])
+async def get_applications(db: Session = Depends(get_db)):
+    result = db.execute(select(Application).order_by(Application.id))
+    applications = result.scalars().all()
+    return applications
+
+@app.post("/team-members", response_model=TeamMemberOut)
+async def add_team_member(member_in: TeamMemberIn, db: Session = Depends(get_db)):
+    db_member = TeamMember(**member_in.dict())
+    db.add(db_member)
+    db.commit()
+    db.refresh(db_member)
+    return db_member
+
+@app.get("/application/{app_id}/team-members", response_model=List[TeamMemberOut],tags=["участники конкретной заявки"])
+async def get_team_members(app_id: int, db: Session = Depends(get_db)):
+    result = db.execute(select(TeamMember).where(TeamMember.application_id == app_id))
+    members = result.scalars().all()
+    return members
+
+@app.get("/application/{app_id}/preview", tags=["Предварительный просмотр заявки"])
+async def preview_application(app_id: int, db: Session = Depends(get_db)):
+    application = db.execute(select(Application).where(Application.id == app_id)).scalars().first()
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found")
+    members = db.execute(select(TeamMember).where(TeamMember.application_id == app_id)).scalars().all()
+    return {
+        "application": ApplicationOut.from_orm(application),
+        "team_members": [TeamMemberOut.from_orm(m) for m in members]
+    }
+
+@app.post("/upload-files", tags=["Загрузка файлов"])
+async def upload_files(
+    file1: UploadFile = File(...),
+    file2: UploadFile = File(...),
+    file3: UploadFile = File(...)
+):
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    filenames = []
+    for file in [file1, file2, file3]:
+        file_location = os.path.join(upload_dir, file.filename)
+        with open(file_location, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        filenames.append(file_location)
+    return {"filenames": filenames}
+
+# Доки для скачивания
+# http://localhost:8000/static/consent.pdf
+# http://localhost:8000/static/participant_info.pdf
+
+@app.get("/download/consent", tags=["Документы"])
+async def download_consent():
+    file_path = "static/consent.pdf"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Документ согласия не найден")
+    return FileResponse(
+        file_path,
+        media_type="application/pdf",
+        filename="consent.pdf"
+    )
+
+@app.get("/download/participant_info", tags=["Документы"])
+async def download_participant_info():
+    file_path = "static/participant_info.pdf"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Документ информации для участника не найден")
+    return FileResponse(
+        file_path,
+        media_type="application/pdf",
+        filename="participant_info.pdf"
+    )
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
